@@ -1,0 +1,289 @@
+# -----------------------------------------------------------------------------
+# Connection details
+# -----------------------------------------------------------------------------
+teleport_addr = "teleport.example.com:3080"
+
+# Identity file generated with:
+#   tctl auth sign --format=file --user=terraform --out=./terraform-identity --ttl=8760h
+# Keep this file out of version control (it is matched by .gitignore; never
+# commit it).
+teleport_identity_file = "./terraform-identity"
+
+# -----------------------------------------------------------------------------
+# Roles
+#
+# The map key is used as the role name unless `name` is set.
+# Role versions: v3..v8 (default v8).
+# -----------------------------------------------------------------------------
+roles = {
+  # Developers: SSH into staging, reach staging apps/databases, k8s access.
+  dev = {
+    description = "Developer access to staging"
+    labels = {
+      team = "platform"
+      env  = "staging"
+    }
+    allow = {
+      logins = ["ubuntu", "deploy"]
+
+      # Label values are lists (OR-matched within a key).
+      node_labels = {
+        env = ["dev", "staging"]
+      }
+      app_labels = {
+        env = ["staging"]
+      }
+      db_labels = {
+        env = ["staging"]
+      }
+      kubernetes_users = ["dev"]
+
+      # Read-only visibility into session history.
+      rules = [{
+        resources = ["session", "app_session", "db_session"]
+        verbs     = ["list", "read"]
+      }]
+    }
+    deny = {
+      # Never allow root or production access.
+      logins      = ["root"]
+      node_labels = { env = ["production"] }
+    }
+    options = {
+      max_session_ttl     = "12h"
+      client_idle_timeout = "30m"
+      forward_agent       = true
+      port_forwarding     = true
+    }
+  }
+
+  # Database administrators: production DB access plus discovery.
+  db-admin = {
+    description = "Database administrators"
+    labels = {
+      team = "data"
+    }
+    allow = {
+      logins    = ["postgres", "mysql"]
+      db_labels = { tier = ["production"] }
+      rules = [{
+        resources = ["db_server", "db"]
+        verbs     = ["list", "read"]
+      }]
+    }
+    options = {
+      max_session_ttl     = "8h"
+      client_idle_timeout = "15m"
+    }
+  }
+
+  # Auditors: read-only view of users, roles and registered resources.
+  # No SSH logins are granted at all.
+  auditor = {
+    description = "Read-only auditor"
+    allow = {
+      rules = [{
+        resources = ["user", "role", "db_server", "app", "kube_cluster"]
+        verbs     = ["list", "read"]
+      }]
+    }
+  }
+
+  # Break-glass admin: everything, short-lived sessions. Assign carefully.
+  emergency-admin = {
+    description = "Break-glass administrator"
+    allow = {
+      logins = ["root", "ubuntu"]
+      rules = [{
+        resources = ["*"]
+        verbs     = ["*"]
+      }]
+    }
+    options = {
+      max_session_ttl = "1h"
+    }
+  }
+}
+
+# -----------------------------------------------------------------------------
+# Users
+#
+# The map key is used as the username unless `name` is set.
+# Role entries can be keys of `roles` above or built-in Teleport role names
+# such as "access", "editor", "auditor" or "deny".
+# -----------------------------------------------------------------------------
+users = {
+  alice = {
+    description = "Alice Example (platform team)"
+    roles       = ["dev"]
+    labels = {
+      team = "platform"
+    }
+    traits = {
+      # Traits are available to role templates, e.g. {{external.github}}.
+      "github" = ["alice-org"]
+    }
+  }
+
+  bob = {
+    description = "Bob Example (data team)"
+    roles       = ["db-admin"]
+    labels = {
+      team = "data"
+    }
+  }
+
+  dave = {
+    description = "Dave Example (compliance)"
+    roles       = ["auditor"] # built-in role name, also valid
+  }
+}
+
+# -----------------------------------------------------------------------------
+# Applications
+#
+# The map key is used as the app name unless `name` is set.
+# -----------------------------------------------------------------------------
+apps = {
+  # Typical HTTP app behind Teleport's application proxy.
+  grafana = {
+    description = "Grafana dashboards"
+    uri         = "http://grafana.internal:3000"
+    public_addr = "grafana.example.com"
+    labels = {
+      env = "staging"
+    }
+    rewrite = {
+      # Include the user's roles in the JWT forwarded to the app.
+      jwt_claims = "roles"
+      headers = [{
+        name  = "X-Custom-Header"
+        value = "example"
+      }]
+      # Hosts rewritten to the app's public address in redirect responses.
+      redirect = ["alt-grafana.internal"]
+    }
+  }
+
+  # HTTPS app with strict upstream TLS verification.
+  admin-console = {
+    description = "Internal admin console"
+    uri         = "https://admin.internal:8443"
+    public_addr = "admin.example.com"
+    tls = {
+      mode        = "verify-full" # verify-full | verify-server-name | verify-spiffe-id | insecure
+      server_name = "admin.internal"
+    }
+  }
+
+  # Raw TCP app (e.g. a non-HTTP service exposed over Teleport).
+  metrics-gateway = {
+    description = "Metrics TCP gateway"
+    uri         = "tcp://metrics.internal:9090"
+    tcp_ports = [{
+      port     = 9090
+      end_port = 9095 # optional port range
+    }]
+  }
+}
+
+# -----------------------------------------------------------------------------
+# Databases
+#
+# The map key is used as the database name unless `name` is set.
+# protocol must be one of: cassandra, clickhouse, clickhouse-http,
+# cockroachdb, dynamodb, elasticsearch, mongodb, mysql, oracle, postgres,
+# redis, snowflake, spanner.
+# -----------------------------------------------------------------------------
+databases = {
+  # Self-hosted PostgreSQL with full TLS verification.
+  staging-postgres = {
+    description = "Staging PostgreSQL"
+    protocol    = "postgres"
+    uri         = "postgres-staging.internal:5432"
+    labels = {
+      env  = "staging"
+      tier = "backend"
+    }
+    tls = {
+      mode        = 0 # 0 = verify-full, 1 = verify-ca, 2 = insecure
+      server_name = "postgres-staging.internal"
+    }
+  }
+
+  # Production MySQL with automatic user provisioning.
+  prod-mysql = {
+    description = "Production MySQL"
+    protocol    = "mysql"
+    uri         = "mysql-prod.internal:3306"
+    labels = {
+      env  = "production"
+      tier = "backend"
+    }
+    admin_user = {
+      name             = "teleport-admin"
+      default_database = "mysql"
+    }
+    mysql = {
+      server_version = "8.0.36"
+    }
+  }
+
+  # MongoDB reached over TLS with a custom private CA.
+  analytics-mongo = {
+    description = "Analytics MongoDB"
+    protocol    = "mongodb"
+    uri         = "mongo-analytics.internal:27017"
+    labels = {
+      env = "production"
+    }
+    tls = {
+      mode        = 1
+      server_name = "mongo-analytics.internal"
+      # Optional PEM-encoded CA for custom/private CAs, e.g.:
+      # ca_cert = file("${path.module}/certs/mongo-ca.pem")
+      ca_cert = null
+    }
+  }
+}
+
+# -----------------------------------------------------------------------------
+# VNet configuration (cluster-wide; one entry is normally enough)
+# -----------------------------------------------------------------------------
+vnet_configs = {
+  default = {
+    description     = "Cluster-wide VNet settings"
+    ipv4_cidr_range = "100.64.0.0/10"
+    custom_dns_zones = [{
+      suffix = "internal.example.com"
+      }, {
+      suffix = "corp.example.com"
+    }]
+  }
+}
+
+# -----------------------------------------------------------------------------
+# Machine ID bots
+#
+# The map key is used as the bot name unless `name` is set.
+# Role entries can be keys of `roles` above or built-in Teleport role names.
+# -----------------------------------------------------------------------------
+bots = {
+  # CI/CD pipeline that deploys to staging.
+  ci-deployer = {
+    description = "CI/CD deployment bot"
+    labels = {
+      team = "platform"
+    }
+    roles = ["dev"]
+  }
+
+  # Backup job that needs database access.
+  backup-agent = {
+    description = "Database backup bot"
+    roles       = ["db-admin"]
+    traits = {
+      "job" = ["backup"]
+    }
+  }
+}
